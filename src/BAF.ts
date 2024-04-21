@@ -76,11 +76,7 @@ bot.once('spawn', async () => {
 })
 
 function connectWebsocket() {
-    if (getConfigProperty('US_INSTANCE') == true) {
-        _websocket = new WebSocket(`ws://sky-us.coflnet.com/modsocket?player=${ingameName}&version=${version}&SId=${getSessionId(ingameName)}`)
-        } else {
-        _websocket = new WebSocket(`wss://sky.coflnet.com/modsocket?player=${ingameName}&version=${version}&SId=${getSessionId(ingameName)}`)
-        }
+    _websocket = new WebSocket(`ws://sky-us.coflnet.com/modsocket?player=${ingameName}&version=${version}&SId=${getSessionId(ingameName)}`)
     _websocket.onopen = function () {
         setupConsoleInterface(bot)
     }
