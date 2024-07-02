@@ -1,203 +1,299 @@
-import { Flip, MyBot } from '../types/autobuy'
-import { getConfigProperty } from './configHelper'
-import { getFastWindowClicker } from './fastWindowClick'
-import { log, printMcChatToConsole } from './logger'
-import { clickWindow, getWindowTitle, numberWithThousandsSeparators, sleep } from './utils'
-import { ChatMessage } from 'prismarine-chat'
-import { sendWebhookItemPurchased, sendWebhookItemPurchased100M } from './webhookHandler'
-import moment from 'moment';
-import { claimPurchased } from './ingameMessageHandler'
+import { ScoreBoard } from 'mineflayer'
+import { createBot } from 'mineflayer'
+import { createFastWindowClicker } from './fastWindowClick'
+import { addLoggerToClientWriteFunction, initLogger, log, printMcChatToConsole } from './logger'
+import { clickWindow, isCoflChatMessage, removeMinecraftColorCodes, sleep } from './utils'
+import { onWebsocketCreateAuction } from './sellHandler'
+import { tradePerson } from './tradeHandler'
+import { swapProfile } from './swapProfileHandler'
+import { flipHandler, registerIngameMessage } from './flipHandler'
+import { claimSoldItem, registerIngameMessageHandler } from './ingameMessageHandler'
+import { MyBot, TextMessageData } from '../types/autobuy'
+import { getConfigProperty, initConfigHelper, updatePersistentConfigProperty } from './configHelper'
+import { getSessionId } from './coflSessionManager'
+import { sendWebhookInitialized, SendWebhookTotals, DisconnectWebwook, webhookInterval } from './webhookHandler'
+import { setupConsoleInterface } from './consoleHandler'
+import { initAFKHandler, tryToTeleportToIsland } from './AFKHandler'
 const fs = require('fs');
 const path = require('path');
+const WebSocket = require('ws')
+var prompt = require('prompt-sync')()
+initConfigHelper()
+initLogger()
+const version = '1.5.0-af'
+let _websocket: WebSocket
+let ingameName = getConfigProperty('INGAME_NAME')
 
-
-let notcoins = false;
-let globalText = "";
-let flips_bed = 0;
-let no_beds = 0;
-let buy_total = 0;  
-let sold_total = 0;
-
-
-function updateTotalsFile() {
-    const filePath = path.join(__dirname, 'totals.txt');
-    const data = `buy_total=${buy_total}\nsold_total=${sold_total}\nflips_bed=${flips_bed}\nno_beds=${no_beds}`;
-    fs.writeFileSync(filePath, data);
+if (!ingameName) {
+    ingameName = prompt('Enter your ingame name: ')
+    updatePersistentConfigProperty('INGAME_NAME', ingameName)
 }
 
-export function registerIngameMessage(bot: MyBot) {
-    bot.on('message', (message: ChatMessage, type) => {
-        let text = message.getText(null)
-        if (type == 'chat') {
-            
-            if (text.startsWith("You") && text.includes("don't have") && text.includes('afford this bid')) {
-                notcoins = true;
-            }
-            if (text.startsWith('You') && text.includes('purchased') && text.includes('for')) {
-                globalText = text;
-            }
-            if (text.startsWith('You purchased')) {
-                buy_total += 1;
-                setTimeout(() => {
-                    updateTotalsFile()
-                }, 100)
-            }
-            if (text.startsWith('[Auction]') && text.includes('bought') && text.includes('for')) {
-                sold_total += 1;
-                setTimeout(() => {
-                    updateTotalsFile()
-                }, 100)
-            }
+const bot: MyBot = createBot({
+    username: ingameName,
+    auth: 'microsoft',
+    logErrors: true,
+    version: '1.17',
+    host: 'mc.hypixel.net'
+})
+bot.setMaxListeners(0)
+
+bot.state = 'gracePeriod'
+createFastWindowClicker(bot._client)
+
+if (getConfigProperty('LOG_PACKAGES')) {
+    addLoggerToClientWriteFunction(bot._client)
+}
+
+bot.once('login', () => {
+    connectWebsocket()
+    bot._client.on('packet', async function (packet, packetMeta) {
+        if (packetMeta.name.includes('disconnect')) {
+            let wss = await getCurrentWebsocket()
+            wss.send(
+                JSON.stringify({
+                    type: 'report',
+                    data: `"${JSON.stringify(packet)}"`
+                })
+            )
+            printMcChatToConsole('§f[§4BAF§f]: §fYou were disconnected from the server...')
+            packet = JSON.parse(JSON.stringify(packet));
+            let reason = JSON.parse(packet.reason);
+            let text = reason.extra[0].text;
+            DisconnectWebwook(text)
+            printMcChatToConsole('§f[§4BAF§f]: §f' + text)
         }
     })
-}
+})
+bot.once('spawn', async () => {
+    await bot.waitForChunksToLoad()
+    await sleep(2000)
+    bot.chat('/play sb')
+    bot.on('scoreboardTitleChanged', onScoreboardChanged)
+    registerIngameMessageHandler(bot)
+    let wss = await getCurrentWebsocket()
+    registerIngameMessage(bot, wss)
+})
 
-export async function flipHandler(bot: MyBot, flip: Flip) {
-    notcoins = false;
-    flip.purchaseAt = new Date(flip.purchaseAt)
-
-    if (bot.state) {
-        setTimeout(() => {
-            flipHandler(bot, flip)
-        }, 1100)
-        return
+function connectWebsocket() {
+    _websocket = new WebSocket(`ws://sky-us.coflnet.com/modsocket?player=${ingameName}&version=${version}&SId=${getSessionId(ingameName)}`)
+    _websocket.onopen = function () {
+        setupConsoleInterface(bot)
     }
-    bot.state = 'purchasing'
-    let timeout = setTimeout(() => {
-        if (bot.state === 'purchasing') {
-            log("Resetting 'bot.state === purchasing' lock")
-            bot.state = null
-            bot.removeAllListeners('windowOpen')
-            notcoins = false;
-        }
-    }, 10000)
-    let isBed = flip.purchaseAt.getTime() > new Date().getTime()
-    let delayUntilBuyStart = isBed ? flip.purchaseAt.getTime() - new Date().getTime()-getConfigProperty('DELAY_TO_REMOVE_BED') : getConfigProperty('FLIP_ACTION_DELAY')
-
-    bot.lastViewAuctionCommandForPurchase = `/viewauction ${flip.id}`
-    await sleep(delayUntilBuyStart)
-    bot.chat(bot.lastViewAuctionCommandForPurchase)
-
-    printMcChatToConsole(
-        `§f[§4BAF§f]: §fTrying to purchase flip${isBed ? ' (Bed)' : ''}: ${flip.itemName} §ffor ${numberWithThousandsSeparators(
-            flip.startingBid
-        )} coins (Target: ${numberWithThousandsSeparators(flip.target)}) §e(Profit: +${numberWithThousandsSeparators(flip.target - flip.startingBid * 0.965).split(".")[0]})`
-    )
-
-    if (getConfigProperty('USE_WINDOW_SKIPS')) {
-        useWindowSkipPurchase(flip, isBed)
-
-        // clear timeout after 1sec, so there are no weird overlaps that mess up the windowIds
-        setTimeout(() => {
-            bot.state = null
-            clearTimeout(timeout)
-        }, 2500)
-    } else {
-        await useRegularPurchase(bot, isBed, flip);
-        await sleep(2000)
-        if (globalText.startsWith('You purchased')) {
-            claimPurchased(bot)
-            let value = flip.target - flip.startingBid;
-            let valueMinus3_5Percent = value * 0.965;
-            let result = numberWithThousandsSeparators(valueMinus3_5Percent);
-            let parts = result.split(".");
-            let formattedValue = parts[0];
-            let numericValue = Number(formattedValue.replace(/,/g, ''));
-
-            if (isBed) {
-                flips_bed += 1
-                updateTotalsFile();
-            }
-            if (!isBed) {
-                no_beds += 1
-                updateTotalsFile();
-            }
-            if (numericValue < 100000000){
-                sendWebhookItemPurchased(globalText.split(' purchased ')[1].split(' for ')[0], 
-                globalText.split(' for ')[1].split(' coins!')[0], `${"+" + formattedValue}`)
-            }
-            if (numericValue >= 100000000) {
-                sendWebhookItemPurchased100M(globalText.split(' purchased ')[1].split(' for ')[0], 
-                globalText.split(' for ')[1].split(' coins!')[0], `${"+" + formattedValue}`)
-            }
-            globalText = '';
-        }
+    _websocket.onmessage = onWebsocketMessage
+    _websocket.onclose = function (e) {
+        log('Connection closed. Reconnecting... ', 'warn')
+        printMcChatToConsole('§f[§4BAF§f]: §4WS Connection closed. Reconnecting... ')
+        setTimeout(function () {
+            connectWebsocket()
+        }, 1000)
+    }
+    _websocket.onerror = function (err) {
+        log('Connection error: ' + JSON.stringify(err), 'error')
+        printMcChatToConsole('§f[§4BAF§f]: §4WS Connection error: ' + JSON.stringify(err))
+        _websocket.close()
     }
 }
 
-async function useRegularPurchase(bot: MyBot, isBed: boolean, flip: Flip) {
-    bot.addListener('windowOpen', async window => {
-        let title = getWindowTitle(window)
-        let window1 = bot.currentWindow;
-        let total_clicks = 0;
-        if (isBed && title.toString().includes('BIN Auction View')) {
-            log(`Starting the bed loop... ${moment().format('ddd MMM DD YYYY HH:mm:ss.SSS [GMT]ZZ')}`)
-            let items = window1.containerItems();
-            bot.state = 'purchasing'
-          
-            // Filtrar o item 'black_stained_glass_pane'
-            items = items.filter(item => item.name !== 'black_stained_glass_pane');
-            let potatoItem = items.find(item => item.name === 'potato');
-          
-            if (potatoItem) {
-              console.log('Item "potato" encontrado. Parando o loop...');
-              return;
-            }
-            
-            while (!title.toString().includes('Confirm Purchase') && !potatoItem) {
-              await sleep(getConfigProperty('DELAY_BETWEEN_CLICKS'));
-              clickWindow(bot, 31);
-              total_clicks++;
+async function onWebsocketMessage(msg) {
+    let message = JSON.parse(msg.data)
+    let data = JSON.parse(message.data)
 
-              // Atualizar a janela e a lista de itens
-              window1 = bot.currentWindow;
-              title = getWindowTitle(window1);
-              items = window1.containerItems().filter(item => item.name !== 'black_stained_glass_pane');
-              potatoItem = items.find(item => item.name === 'potato');
-          
-              if (potatoItem) {
-                console.log('Item "potato" found. Stopping the loop.');
-                break;
-              }
-              if (notcoins || total_clicks > 300) {
-                let title = getWindowTitle(window1)
-                if (title.toString().includes('BIN Auction View')) {
-                    
-                    printMcChatToConsole("§f[§4BAF§f]: §cClosing this flip because you don't have enough coins to purchase!")
-                    bot.removeAllListeners('windowOpen')
-                    bot.state = null
-                    bot.closeWindow(window)
-                    notcoins = false
-                    return
+    switch (message.type) {
+        case 'flip':
+            log(message, 'debug')
+            flipHandler(bot, data)
+            break
+        case 'chatMessage':
+            for (let da of [...(data as TextMessageData[])]) {
+                let isCoflChat = isCoflChatMessage(da.text)
+                if (da.text.startsWith("Your") && da.text.includes("connection id is")) {
+                    let textmsg = da.text.replace(',', '').split(' ');
+                    let ID = textmsg[4]
+                    sendWebhookInitialized(ID)
                 }
-              }
+                if (!isCoflChat) {
+                    log(message, 'debug')
+                }
+                if (getConfigProperty('USE_COFL_CHAT') || !isCoflChat) {
+                    printMcChatToConsole(da.text)
+                }
             }
-            log(`Finished the bed loop... ${moment().format('ddd MMM DD YYYY HH:mm:ss.SSS [GMT]ZZ')}`)
-            printMcChatToConsole(`§f[§4BAF§f]: §l§6Clicked ${total_clicks} times on the bed.`);
-            total_clicks = 0;
-        }
+            break
+        case 'writeToChat':
+            let isCoflChat = isCoflChatMessage(data.text)
+            if (!isCoflChat) {
+                log(message, 'debug')
+            }
+            if (getConfigProperty('USE_COFL_CHAT') || !isCoflChat) {
+                printMcChatToConsole((data as TextMessageData).text)
+            }
+            break
+        case 'swapProfile':
+            log(message, 'debug')
+            swapProfile(bot, data)
+            break
+        case 'createAuction':
+            log(message, 'debug')
+            onWebsocketCreateAuction(bot, data)
+            break
+        case 'trade':
+            log(message, 'debug')
+            tradePerson(bot, data)
+            break
+        case 'tradeResponse':
+            let tradeDisplay = (bot.currentWindow.slots[39].nbt.value as any).display.value.Name.value
+            if (tradeDisplay.includes('Deal!') || tradeDisplay.includes('Warning!')) {
+                await sleep(3400)
+            }
+            clickWindow(bot, 39)
+            break
+        case 'getInventory':
+            log('Uploading inventory...')
+            let wss = await getCurrentWebsocket()
+            wss.send(
+                JSON.stringify({
+                    type: 'uploadInventory',
+                    data: JSON.stringify(bot.inventory)
+                })
+            )
+            break
+        case 'execute':
+            log(message, 'debug')
+            if (data.startsWith('/cofl')) {
+                let splits = data.split(' ')
+                splits.shift() // remove /cofl
+                let command = splits.shift()
 
-        if (title.toString().includes('BIN Auction View')) {
-            clickWindow(bot, 31)
-        }
-
-        if (title.toString().includes('Confirm Purchase')) {
-            clickWindow(bot, 11)
-            bot.removeAllListeners('windowOpen')
-            bot.state = null
-            return
-        }
-    })
+                wss.send(
+                    JSON.stringify({
+                        type: command,
+                        data: `"${splits.join(' ')}"`
+                    })
+                )
+            } else {
+                bot.chat(data)
+            }
+            break
+        case 'privacySettings':
+            log(message, 'debug')
+            data.chatRegex = new RegExp(data.chatRegex)
+            bot.privacySettings = data
+            break
+    }
 }
 
-async function useWindowSkipPurchase(flip: Flip, isBed: boolean) {
-    let lastWindowId = getFastWindowClicker().getLastWindowId()
+async function onScoreboardChanged() {
+    if (
+        bot.scoreboard.sidebar.items.map(item => item.displayName.getText(null).replace(item.name, '')).find(e => e.includes('Purse:') || e.includes('Piggy:'))
+    ) {
+        bot.removeListener('scoreboardTitleChanged', onScoreboardChanged)
+        log('Joined SkyBlock')
+        initAFKHandler(bot)
+        setTimeout(async () => {
+            let wss = await getCurrentWebsocket()
+            log('Waited for grace period to end. Flips can now be bought.')
+            bot.state = null
+            bot.removeAllListeners('scoreboardTitleChanged')
 
-    if (isBed) {
-        getFastWindowClicker().clickBedPurchase(flip.startingBid, lastWindowId + 1)
-    } else {
-        getFastWindowClicker().clickPurchase(flip.startingBid, lastWindowId + 1)
+            wss.send(
+                JSON.stringify({
+                    type: 'uploadScoreboard',
+                    data: JSON.stringify(bot.scoreboard.sidebar.items.map(item => item.displayName.getText(null).replace(item.name, '')))
+                })
+            )
+        }, 5500)
+        await sleep(2500)
+        tryToTeleportToIsland(bot, 0)
+
+        await sleep(20000)
+        // trying to claim sold items if sold while user was offline
+        claimSoldItem(bot)
     }
-    await sleep(getConfigProperty('FLIP_ACTION_DELAY'))
-    getFastWindowClicker().clickConfirm(flip.startingBid, flip.itemName, lastWindowId + 2)
+}
+
+let executed = true;
+async function sendWebhookTotalsMSG(buyTotal: number, soldTotal: number) {
+    if (executed) {
+        const filePath = path.join(__dirname, 'totals.txt');
+
+        if (!fs.existsSync(filePath)) {
+            fs.writeFileSync(filePath, 'buy_total=0\nsold_total=0');
+        }
+
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        const lines = fileContent.split('\n');
+
+        for (const line of lines) {
+            const [key, value] = line.split('=');
+            if (key === 'buy_total') {
+                buyTotal = parseInt(value, 10);
+            } else if (key === 'sold_total') {
+                soldTotal = parseInt(value, 10);
+            }
+        }
+        
+        await SendWebhookTotals(buyTotal, soldTotal);
+
+        const fileContent2 = `buy_total=0\nsold_total=0`;
+        fs.writeFileSync(filePath, fileContent2);
+        executed = false;
+    }
+}
+
+sendWebhookTotalsMSG(0, 0);
+
+const startSession = (Date.now() / 1000).toFixed(0)
+
+function formatNumber(num) {
+    if (num >= 1000000000) {
+        return (num / 1000000000).toFixed(2) + 'B';
+    }
+    if (num >= 1000000) {
+        return (num / 1000000).toFixed(2) + 'M';
+    }
+    if (num >= 1000) {
+        return (num / 1000).toFixed(2) + 'K';
+    }
+    return num;
+}
+
+
+async function updateSession(buyTotal: number, soldTotal: number) {
+    const filePath = path.join(__dirname, 'totals.txt');
+
+    if (!fs.existsSync(filePath)) {
+        fs.writeFileSync(filePath, 'buy_total=0\nsold_total=0');
+    }
+
+    setInterval(async () => {
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        const lines = fileContent.split('\n');
+        let test = bot.scoreboard.sidebar.items.map(item => item.displayName.getText(null).replace(item.name, '')).find(e => e.includes('Purse:') || e.includes('Piggy:'))
+        let purse = test.replace('Purse: ', '').replace(/,/g, '');
+        purse = formatNumber(Number(purse));
+
+        for (const line of lines) {
+            const [key, value] = line.split('=');
+            if (key === 'buy_total') {
+                buyTotal = parseInt(value, 10);
+            } else if (key === 'sold_total') {
+                soldTotal = parseInt(value, 10);
+            }
+        }
+        
+        await webhookInterval(buyTotal, soldTotal, startSession, purse);
+    }, 30 * 60 * 1000);
+}
+updateSession(0, 0);
+
+export async function getCurrentWebsocket(): Promise<WebSocket> {
+    if (_websocket.readyState === WebSocket.OPEN) {
+        return _websocket
+    }
+    return new Promise(async resolve => {
+        await sleep(1000)
+        let socket = await getCurrentWebsocket()
+        resolve(socket)
+    })
 }
