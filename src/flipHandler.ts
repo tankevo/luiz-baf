@@ -95,6 +95,7 @@ async function useRegularPurchase(bot: MyBot, isBed: boolean) {
         let title = getWindowTitle(window)
         let window1 = bot.currentWindow;
         let total_clicks = 0;
+
         if (isBed && title.toString().includes('BIN Auction View')) {
             let items = window1.containerItems();
           
@@ -112,8 +113,7 @@ async function useRegularPurchase(bot: MyBot, isBed: boolean) {
             while (bedItem && !title.toString().includes('Confirm Purchase') && !potatoItem) {
               await sleep(getConfigProperty('DELAY_BETWEEN_CLICKS'));
               clickWindow(bot, 31);
-                total_clicks++;
-
+              total_clicks++; // Aqui é onde total_clicks deve ser incrementado
           
               // Atualizar a janela e a lista de itens
               window1 = bot.currentWindow;
@@ -140,7 +140,8 @@ async function useRegularPurchase(bot: MyBot, isBed: boolean) {
             }
             printMcChatToConsole(`§f[§4BAF§f]: §l§6Clicked ${total_clicks} times on the bed.`);
             total_clicks = 0;
-          }
+        }
+
         if (title.toString().includes('BIN Auction View')) {
             clickWindow(bot, 31)
         }
